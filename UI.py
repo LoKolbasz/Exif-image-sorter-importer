@@ -368,7 +368,6 @@ class GUI(object):
             self.start_button.configure(state="disabled")
             self.options.recursive = self.recusrsive.get()
             self.options.force_overwrite = self.force.get()
-            print(self.options)
             self.progress_num = 0
             self.importer_thread = threading.Thread(
                 target=self.importer.Import, args=(self.options,)
