@@ -72,7 +72,7 @@ class Importer:
                     2,
                     f'\33[1;32m"{self.dst}" directory not found.\33[1;0m Creating directory by the same name',
                 )
-                self.copy_failed_event.__call__(self.dst, "Directory not found")
+                self.copy_failed_event.__call__(e.args[0], "")
                 os.makedirs(self.dst)
                 shutil.move(self.src, newname)
 
