@@ -35,9 +35,6 @@ class Importer:
     dataclass(slots=True, frozen=True)
 
     class FromTo:
-        src: str
-        dst: str
-
         def __init__(
             self,
             src,
