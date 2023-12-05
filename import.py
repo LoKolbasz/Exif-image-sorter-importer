@@ -6,7 +6,22 @@ import argparse
 # import timeit
 import os
 from pathlib import Path
-from tkinter import BooleanVar, Checkbutton, font
+from select import select
+from tkinter import (
+    BOTTOM,
+    E,
+    LEFT,
+    RIGHT,
+    TOP,
+    W,
+    Y,
+    BooleanVar,
+    Checkbutton,
+    Frame,
+    IntVar,
+    Toplevel,
+    font,
+)
 from tkinter.font import Font
 from typing import Tuple
 from more_itertools import grouper
@@ -16,6 +31,7 @@ import concurrent.futures
 from exiftool import ExifToolHelper
 from exiftool.exceptions import ExifToolExecuteError
 from dataclasses import dataclass, field
+import threading
 
 from tkinter import (
     BOTH,
@@ -132,6 +148,10 @@ class Importer:
         self.events = Msges()
         self.new_copied_event = MsgEvent()
         self.copy_failed_event = MsgEvent()
+        self.copy_done_event = MsgEvent()
+        self.collected_files_event = MsgEvent()
+        self.completed_event = MsgEvent()
+        self.stop = False
 
     dataclass(slots=True, frozen=True)
 
@@ -146,13 +166,18 @@ class Importer:
             events,
             new_copied_event,
             copy_failed_event,
+            copy_done_event,
+            collected_files_event,
         ) -> None:
             self.src = src
             self.dst = dst
             self.events = events
             self.new_copied_event = new_copied_event
             self.copy_failed_event = copy_failed_event
+            self.copy_done_event = copy_done_event
+            self.collected_files_event = collected_files_event
 
+        # Moves a file from self.src to a previously calculated self.dst.
         def Move(self, force):
             newname = self.dst
             if force:
@@ -160,6 +185,7 @@ class Importer:
             try:
                 self.new_copied_event.__call__(self.src, newname)
                 shutil.move(self.src, newname)
+                self.copy_done_event.__call__(self.src, newname)
             except IOError as e:
                 self.events.__call__(2, str(e))
                 if e.strerror == "Not a directory":
@@ -174,7 +200,16 @@ class Importer:
                 os.makedirs(self.dst)
                 shutil.move(self.src, newname)
 
-        def initExif(src, dst, events):
+        # Initialises a FromTo instance and returns it. It is used to convert arguments to formats expected by __init__
+        def initExif(
+            src,
+            dst,
+            events,
+            new_copied_event,
+            copy_failed_event,
+            copy_done_event,
+            collected_files_event,
+        ):
             return Importer.FromTo(
                 src,
                 os.path.join(
@@ -185,8 +220,11 @@ class Importer:
                 events,
                 new_copied_event,
                 copy_failed_event,
+                copy_done_event,
+                collected_files_event,
             )
 
+        # Gets the filetype. It is used to get the filetype directory name
         def whatType(img):
             try:
                 with ExifToolHelper() as et:
@@ -197,6 +235,7 @@ class Importer:
                     return tp[-1].lower()
                 return "misc"
 
+        # Gets the tag value (specified by the rag argument) of a meta exiftool metadata object
         def getTagVal(meta, tag):
             for k, v in meta[0].items():
                 splat = k.split(":")
@@ -204,6 +243,7 @@ class Importer:
                     return v
             raise NotFoundException(tag + " was not found")
 
+        # Gets the date the file was created on using exiftool. If a suitable tag is not found, the current date is returned in the YYYY.MM.DD format
         def getExifDate(img):
             try:
                 with ExifToolHelper() as et:
@@ -216,24 +256,37 @@ class Importer:
             except ExifToolExecuteError:
                 return datetime.strftime(datetime.now(), "%Y.%m.%d")
 
-    def moveImages(self, srcImg, dst, force):
+    # Moves a collection of images to the specified directory. The new path of the files will be: destination/filetype/file creation date/ original file name
+    def moveImages(self, srcImg, dst: str, force: bool):
         for img in srcImg:
+            if self.stop:
+                break
             Importer.FromTo.initExif(
-                img, dst, self.events, self.new_copied_event, self.copy_failed_event
+                img,
+                dst,
+                self.events,
+                self.new_copied_event,
+                self.copy_failed_event,
+                self.copy_done_event,
+                self.collected_files_event,
             ).Move(force)
 
-    def importImages(self, destination, files, force):
+    # Moves a collection of images concurrently to the specified directory. The new path follows the destination/filetype/file creation data/original filename  pattern
+    def importImages(self, destination: str, files: list[str], force):
         if destination[-1] != "/":
             destination += "/"
         try:
             if not files:
                 raise ValueError("No files selected for import")
-            executor = concurrent.futures.ProcessPoolExecutor(10)
+            # Create concurrent threads
+            executor = concurrent.futures.ThreadPoolExecutor(10)
             futures = [
                 executor.submit(self.moveImages, group, destination, force)
+                # Divides the collection into groups of 5 (at most)
                 for group in grouper(files, 5)
             ]
             concurrent.futures.wait(futures)
+            # self.moveImages(files, destination, force)
         except NotFoundException:
             return 1
         except ValueError as e:
@@ -241,6 +294,7 @@ class Importer:
             return 2
         return 0
 
+    # Collects the files both in the parent and in the subdirectories and returns them as a list of strings that are the paths to those files
     def GetFilesRecursively(self, src):
         return [
             t
@@ -251,6 +305,7 @@ class Importer:
             for t in f
         ]
 
+    # Collects the files in the specified directory and returns them as a collection of strings that are paths to those fles
     def GetFilesNonRecursively(self, src):
         return [
             os.path.join(src, f)
@@ -258,6 +313,7 @@ class Importer:
             if os.path.isfile(os.path.join(src, f))
         ]
 
+    # Collects the files to be processed
     def GetFiles(self, src: str, isRecursive: bool):
         if isRecursive:
             self.events.__call__(1, "Getting files recursively")
@@ -268,18 +324,27 @@ class Importer:
         self.events.__call__(
             1, f"Searching for files has finished. Found {len(files)} files."
         )
+        self.collected_files_event.__call__(files)
         return files
 
+    # Wrapper for the whole import procvess
     def Import(self, options: Options):
         self.events.__call__(1, "Starting import")
+        self.stop = False
         self.importImages(
             files=self.GetFiles(src=options.source, isRecursive=options.recursive),
             destination=options.destination,
             force=options.force_overwrite,
         )
         self.events.__call__(1, "Finished")
+        self.completed_event.__call__()
+
+    # Stop the importing
+    def cancel(self):
+        self.stop = True
 
 
+# An event that can be used to perform callbacks
 class MsgEvent(object):
     def __init__(self):
         self.eventSubs = []
@@ -295,6 +360,7 @@ class MsgEvent(object):
             Ehandler(args, kwds)
 
 
+# A collection of functions used to print multiple levels of logging data
 class Msg:
     def __init__(self, *args):
         self.text = []
@@ -325,6 +391,7 @@ class Msg:
         m.display()
 
 
+# A collection of events used to perform callbacks for multilevel logging
 class Msges(MsgEvent):
     def __init__(self, lvls: int = 3) -> None:
         self.lvls = [MsgEvent()]
@@ -373,6 +440,8 @@ class GUI(object):
     color_scheme: ColorSchemeHex
 
     def __init__(self, imp: Importer):
+        self.importer_thread = threading.Thread()
+        self.counter_lock = threading.Lock()
         self.main_window = Tk()
         self.options = Options(str(Path.home()), str(Path.home()))
         self.label_font = Font(size=11)
@@ -391,6 +460,13 @@ class GUI(object):
             f"#{self.flavour.yellow.hex}",
         )
         self.init_gui()
+        self.importer.new_copied_event.__isub__(self.new_copied)
+        self.importer.copy_failed_event.__isub__(self.copy_error)
+        self.importer.copy_done_event.__isub__(self.copy_done)
+        self.importer.collected_files_event.__isub__(self.found_files)
+        self.importer.completed_event.__isub__(self.on_completion)
+        # self.importer.events.__isub__(self.on_warning, 2)
+        # self.importer.events.__isub__(self.on_error, 3)
         self.main_window.mainloop()
 
     def init_gui(self):
@@ -406,7 +482,7 @@ class GUI(object):
     # Builds the starting GUI
     def build_directory_selector_gui(self):
         container = PanedWindow(
-            self.main_window, background=self.color_scheme.background
+            self.main_window, background=self.color_scheme.background, orient=VERTICAL
         )
         container.pack(padx=30, pady=30, fill=X, expand=True)
 
@@ -414,21 +490,20 @@ class GUI(object):
 
         # Source Directory
         (src_btn, self.src_txt, self.src_err) = self.dir_gui(
-            container, "Source Directory"
+            container, "Source Directory:"
         )
         src_btn.configure(command=self.select_src_dir)
 
         # Target directory
         (dst_btn, self.dst_txt, self.dst_err) = self.dir_gui(
-            container, "Target Directory"
+            container, "Target Directory:"
         )
         dst_btn.configure(command=self.select_dst_dir)
 
         # Checkboxes for the bool options
-        chckbox_panel = PanedWindow(
+        chckbox_panel = Frame(
             container,
-            orient=HORIZONTAL,
-            borderwidth=2,
+            # borderwidth=2,
             relief="groove",
             background=self.color_scheme.background,
         )
@@ -437,10 +512,10 @@ class GUI(object):
         chckbox_padder = Label(
             chckbox_panel,
             height=chckbox_height,
-            width=100,
+            width=70,
             background=self.color_scheme.background,
         )
-        chckbox_panel.add(chckbox_padder)
+        chckbox_padder.pack(side=RIGHT, expand=True, fill=X)
         recursive_chckbx = Checkbutton(
             chckbox_panel,
             text="Recursive",
@@ -451,8 +526,10 @@ class GUI(object):
             height=chckbox_height,
             font=self.label_font,
             variable=self.recusrsive,
+            width=len("Recursive"),
+            borderwidth=0,
         )
-        chckbox_panel.add(recursive_chckbx)
+        recursive_chckbx.pack(side=LEFT)
         force_chckbx = Checkbutton(
             chckbox_panel,
             text="Force overwrite",
@@ -463,15 +540,32 @@ class GUI(object):
             height=chckbox_height,
             font=self.label_font,
             variable=self.force,
+            width=len("Force overwrite"),
+            borderwidth=0,
         )
-        chckbox_panel.add(force_chckbx)
-
+        force_chckbx.pack(side=LEFT)
+        # Infopanel
+        # This is the widget that dispalys the currently copied source file, its destination, and errors encountered during the moving process
+        warn_height = 15
+        info = Frame(
+            container,
+            relief="groove",
+            background=self.color_scheme.background,
+        )
+        self.warn_err = Text(
+            info,
+            background=self.color_scheme.background,
+            foreground=self.color_scheme.text_color,
+            font=self.text_font,
+            height=warn_height,
+            width=200,
+        )
+        self.warn_err.pack()
+        info.pack()
         # Start button
         # Initiates the verification of the inputs and starts the sorting
-        start_button_panel = PanedWindow(
+        start_button_panel = Frame(
             container,
-            orient=HORIZONTAL,
-            borderwidth=2,
             relief="groove",
             background=self.color_scheme.background,
         )
@@ -485,32 +579,43 @@ class GUI(object):
             activebackground=self.color_scheme.button_hover,
             activeforeground=self.color_scheme.text_color,
             font=self.label_font,
+            width=len("Start sorting"),
+            height=1,
         )
-        # Infopanel
-        # This is the widget that dispalys the currently copied source file, its destination, and errors encountered during the moving process
-        info = PanedWindow(
-            start_button_panel,
-            orient=VERTICAL,
-            relief="groove",
-            background=self.color_scheme.background,
-        )
-        self.warn_err = Text(
-            info,
-            background=self.color_scheme.background,
-            foreground=self.color_scheme.text_color,
-            font=self.text_font,
-        )
-        info.add(self.warn_err)
+        self.start_button.pack(side=RIGHT)
         self.current_file = Label(
-            info,
+            start_button_panel,
             background=self.color_scheme.background,
             foreground=self.color_scheme.text_color,
             font=self.label_font,
-            height=2,
+            height=1,
+            width=200 - len("Start sorting"),
         )
-        info.add(self.current_file)
-        start_button_panel.add(info)
-        start_button_panel.add(self.start_button)
+        self.current_file.pack(side=RIGHT)
+        start_button_panel.pack()
+        self.num_files = value = 0
+        self.progress_num = 0
+        # Progress indicator
+        progress_panel = Frame(
+            container, background=self.color_scheme.background, relief="groove"
+        )
+        self.progressbar = ttk.Progressbar(
+            progress_panel,
+            orient="horizontal",
+            length=200,
+            mode="determinate",
+        )
+        self.progressbar.pack(side=LEFT)
+        self.progress_percentage = Label(
+            progress_panel,
+            background=self.color_scheme.background,
+            foreground=self.color_scheme.text_color,
+            font=self.label_font,
+            text="0%",
+            width=4,
+        )
+        self.progress_percentage.pack(side=LEFT)
+        progress_panel.pack()
 
     # Ask for confirmation of closing
     def on_closing(self):
@@ -518,6 +623,9 @@ class GUI(object):
             "Exit",
             "Are you sure, that you want to exit the application?\nThis will stop the sorting and leave already sorted files in their respective directories",
         ):
+            if self.importer_thread.is_alive():
+                self.importer.cancel()
+                self.importer_thread.join()
             self.main_window.destroy()
 
     # The function to call in order  to start the execution of the sorter
@@ -537,19 +645,23 @@ class GUI(object):
         else:
             self.dst_err.configure(text="", foreground=self.color_scheme.text_color)
         if ready:
+            self.start_button.configure(state="disabled")
             self.options.recursive = self.recusrsive.get()
             self.options.force_overwrite = self.force.get()
-            self.importer.Import(self.options)
+            print(self.options)
+            self.progress_num = 0
+            self.importer_thread = threading.Thread(
+                target=self.importer.Import, args=(self.options,)
+            )
+            self.importer_thread.start()
 
     # The standardised way to generate a directory selector
     def dir_gui(
         self, container: PanedWindow, label_text: str
     ) -> Tuple[Button, Text, Label]:
-        dir_height = 30
-        dir_panel = PanedWindow(
+        dir_height = 10
+        dir_panel = Frame(
             container,
-            orient=HORIZONTAL,
-            borderwidth=2,
             relief="groove",
             background=self.color_scheme.background,
             height=dir_height,
@@ -561,25 +673,29 @@ class GUI(object):
             background=self.color_scheme.background,
             foreground=self.color_scheme.text_color,
             font=self.label_font,
+            width=len(label_text),
         )
-        dir_panel.add(dir_label)
-        dir_panel.add(ttk.Separator(dir_panel))
+        dir_label.pack(side=LEFT, expand=False)
         current_dir = Path.home()
         dir_selected = Text(
             dir_panel,
             background=self.color_scheme.background,
             foreground=self.color_scheme.text_color,
             font=self.text_font,
+            height=1,
+            wrap="none",
+            width=60,
         )
         dir_selected.insert(INSERT, str(current_dir))
-        dir_panel.add(dir_selected)
+        dir_selected.pack(side=LEFT, expand=True, fill=X)
         dir_err = Label(
             dir_panel,
             background=self.color_scheme.background,
             font=self.label_font,
             foreground=self.color_scheme.text_color,
+            width=3,
         )
-        dir_panel.add(dir_err)
+        dir_err.pack(side=LEFT, expand=False)
         dir_button = Button(
             dir_panel,
             text="Select",
@@ -588,17 +704,20 @@ class GUI(object):
             activebackground=self.color_scheme.button_hover,
             activeforeground=self.color_scheme.text_color,
             font=self.label_font,
+            borderwidth=0,
+            height=1,
         )
-        dir_panel.add(dir_button)
+        dir_button.pack(side=LEFT, expand=False)
         return (dir_button, dir_selected, dir_err)
 
     def select_src_dir(self):
         tmp = filedialog.askdirectory(
-            initialdir=str(Path.home()),
+            initialdir=self.options.source,
             title="Source Directory",
             mustexist=True,
         )
-        self.set_src_dir(tmp)
+        if len(tmp.strip()) > 0:
+            self.set_src_dir(tmp)
 
     def set_src_dir(self, dir: str):
         self.options.source = dir
@@ -607,11 +726,12 @@ class GUI(object):
 
     def select_dst_dir(self):
         tmp = filedialog.askdirectory(
-            initialdir=str(Path.home()),
+            initialdir=self.options.destination,
             title="Destination Directory",
             mustexist=True,
         )
-        self.set_dst_dir(tmp)
+        if len(tmp.strip()):
+            self.set_dst_dir(tmp)
 
     def set_dst_dir(self, dir: str):
         self.options.source = dir
@@ -619,11 +739,45 @@ class GUI(object):
         self.dst_txt.insert(INSERT, self.options.source)
 
     def new_copied(self, *args, **kwds):
-        self.current_file.delete("1.0", END)
-        self.current_file.insert("1.0", f"{args[0]} is being copied to: {args[1]}")
+        self.current_file.configure(
+            text=f"Moving: '...{args[0][0][len(self.options.source):]}'"
+        )
 
     def copy_error(self, *args, **kwds):
-        self.warn_err.insert("1.0", f"{args[0]} {args[1]}")
+        self.insert_warn_err(f"\n{args[0][0]} {args[0][1]}")
+
+    def on_error(self, *args, **kwds):
+        self.insert_warn_err(f"\n{args[0][0]}")
+
+    def on_warning(self, *args, **kwds):
+        self.insert_warn_err(f"\n{args[1]['args'][0]}\n")
+
+    def copy_done(self, *args, **kwds):
+        if self.num_files == 0:
+            return
+        with self.counter_lock:
+            self.progress_num += 1
+            percentage = 100 * self.progress_num / self.num_files
+            self.progressbar["value"] = percentage
+        self.progress_percentage.configure(
+            text=f"{round(100 * self.progress_num / self.num_files)}%"
+        )
+
+    def found_files(self, *args, **kwds):
+        self.num_files = len(args[0][0])
+
+    def on_completion(self, *args, **kwds):
+        self.start_button.configure(state="normal")
+        self.insert_warn_err(
+            f"Done!\n{self.progress_num} out of {self.num_files} were moved.\n"
+        )
+        self.progress_num = 0
+
+    def insert_warn_err(self, text: str):
+        self.warn_err.configure(state="normal")
+        self.warn_err.insert(INSERT, text)
+        self.warn_err.configure(state="disabled")
+        self.warn_err.see(END)
 
 
 if __name__ == "__main__":
