@@ -487,13 +487,13 @@ class GUI(object):
 
     # Method called when the importer encounters an issue
     def copy_error(self, *args, **kwds):
-        self.insert_warn_err(f"\n{args[0][0]} {args[0][1]}")
+        self.insert_warn_err(f"{args[0][0]} {args[0][1]}\n")
 
     def on_error(self, *args, **kwds):
-        self.insert_warn_err(f"\n{args[0][0]}")
+        self.insert_warn_err(f"{args[0][0]}\n")
 
     def on_warning(self, *args, **kwds):
-        self.insert_warn_err(f"\n{args[1]['args'][0]}\n")
+        self.insert_warn_err(f"{args[1]['args'][0]}\n")
 
     # Method called by the importer a file has been copied
     def copy_done(self, *args, **kwds):
